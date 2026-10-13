@@ -3,3 +3,14 @@ sdk/4.13.bak
 projects/*
 !projects/*.uvprojx
 src/test
+
+# 主机侧自测/体积测量的临时产物
+build/
+
+# 本地第三方资料：模组手册 PDF 与官方烧录工具包，体积大（约 27MB）且非本工程源码，不入库
+/*.pdf
+/*.rar
+/RDA5981_烧录工具_V01.00.10_20180930/
+
+# 自测脚本的字节码缓存
+tools/__pycache__/

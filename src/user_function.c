@@ -68,7 +68,9 @@ void USER_FUNC user_function_cmd_received(char *pusrdata, int datalen, char *rsp
         else if (strcmp(p_cmd->valuestring, "save_plug_config") == 0)
         {
             user_mqtt_publish("save_plug_config");
-            save_plug_config(&user_plug_config);
+            /* 交给 userbin 保存线程统一落盘（唯一写者；直接写会和其它
+             * 写者并发擦同一页，也会踩定时器上下文不能写 flash 的坑） */
+            update_plug_config_flag = true;
         }
         // plug status cmd
         else if (strcmp(p_cmd->valuestring, "init_plug_status") == 0)

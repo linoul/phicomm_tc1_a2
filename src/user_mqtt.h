@@ -26,6 +26,7 @@ void mqtt_report_config(void);
 void mqtt_clear_config(void);
 void mqtt_report_status(void);
 void mqtt_report_plug_status(uint8_t);
+void mqtt_report_energy(void);
 
 #ifdef __cplusplus
 }

@@ -3,8 +3,9 @@
 #include "user_mqtt.h"
 #include "user_function.h"
 #include "user_gpio.h"
+#include "user_bl0937.h"
 #include "MQTTClient.h"
-#include "cJSON.h"
+#include "cJSON/cJSON.h"
 
 #define MQTT_DEBUG_LEVEL 5
 
@@ -24,7 +25,49 @@ char plug_status_topic_list[PLUG_NUM][MQTT_TOPIC_MAX_LEN + 1];
 char plug_config_topic_list[PLUG_NUM][MQTT_TOPIC_MAX_LEN + 1];
 char cmd_topic[MQTT_TOPIC_MAX_LEN + 1];
 
-const char hass_plug_config[] = "{\"name\":\"%s_%d\",\"unique_id\":\"%s_%d\",\"~\":\"%s/plug_%d\",\"state_topic\":\"~/status\",\"command_topic\":\"~/cmd\"}";
+/* 计量数据的上报 topic：{hass_topic}/switch/{clientid}/energy */
+char energy_state_topic[MQTT_TOPIC_MAX_LEN + 1];
+
+const char hass_plug_config[] =
+	"{\"name\":\"插口%d\","
+	"\"unique_id\":\"%s_%d\","
+	"\"~\":\"%s/plug_%d\","
+	"\"state_topic\":\"~/status\",\"command_topic\":\"~/cmd\","
+	"\"payload_on\":\"ON\",\"payload_off\":\"OFF\","
+	"\"state_on\":\"ON\",\"state_off\":\"OFF\","
+	"\"device\":{\"identifiers\":[\"%s\"],\"name\":\"%s\",\"model\":\"TC1 A2 + BL0937\",\"manufacturer\":\"PHICOMM\"}}";
+/* unique_id 沿用旧固件格式（%s_%d = clientid_插口号），保证升级时 HA 原地更新而非新建重复实体。
+ * 参数顺序（sprintf）：插口号(1基) / unique_id前缀(clientid) / 插口号 / ~基(pub_topic) /
+ * 插口号 / device.identifiers(clientid) / device.name(clientid) */
+
+/* 计量传感器：key 同时作为 JSON 字段名和 unique_id 后缀 */
+typedef struct _HASS_SENSOR_T
+{
+	const char *key;
+	const char *cn;
+	const char *unit;
+	const char *dclass;
+	const char *sclass;
+} HASS_SENSOR_T;
+
+static const HASS_SENSOR_T hass_sensors[] = {
+	{"power", "功率", "W", "power", "measurement"},
+	{"energy", "总电量", "kWh", "energy", "total_increasing"},
+};
+/* 注：电压/电流默认不接入 HA。BL0937_USE_CF1=0 时电压只是标定的电网常数、
+ * 电流是 P/V 反算的合成值（见 user_bl0937.c），并非真实计量；故屏蔽其发现，
+ * 仅保留由 CF 实测的功率与由其积分的电量。另见 mqtt_report_config 末尾的主动撤销。 */
+#define HASS_SENSOR_NUM (sizeof(hass_sensors) / sizeof(hass_sensors[0]))
+
+const char hass_sensor_config[] =
+	"{\"name\":\"%s %s\",\"unique_id\":\"%s_%s\",\"state_topic\":\"%s\","
+	"\"value_template\":\"{{value_json.%s}}\",\"unit_of_measurement\":\"%s\","
+	"\"device_class\":\"%s\",\"state_class\":\"%s\","
+	"\"device\":{\"identifiers\":[\"%s\"],\"name\":\"%s\",\"model\":\"TC1 A2 + BL0937\","
+	"\"manufacturer\":\"PHICOMM\"}}";
+
+/* 计量数据的 MQTT 上报间隔（毫秒） */
+#define MQTT_ENERGY_REPORT_INTERVAL 30000
 
 static void mqtt_status_callback(int connect)
 {
@@ -105,6 +148,7 @@ static void MQTTClient_thread(void *arg)
 {
 	int ping_time = 0;
 	int report_time = 0;
+	int energy_time = 0;
 	HF_Debug(MQTT_DEBUG_LEVEL, "MQTTClient_thread start.\r\n");
 
 	int ret;
@@ -194,6 +238,13 @@ static void MQTTClient_thread(void *arg)
 				mqtt_report_status();
 			}
 
+			//定期上报计量数据（功率/电压/电流/电量）
+			if (hfsys_get_time() - energy_time > MQTT_ENERGY_REPORT_INTERVAL)
+			{
+				energy_time = hfsys_get_time();
+				mqtt_report_energy();
+			}
+
 			//应用层实现ping功能 防止 mqtt异常断开
 			if (hfsys_get_time() - ping_time > (MQTTConnectData.keepAliveInterval - 10) * 1000)
 			{
@@ -263,6 +314,7 @@ void update_mqtt_config(MQTT_CONFIG *mqtt)
 	sprintf(mqtt->pub_topic, "%s/switch/%s", mqtt->hass_topic, mqtt->clientid);
 	sprintf(mqtt->sub_topic, "%s/switch/%s/+/cmd", mqtt->hass_topic, mqtt->clientid);
 	sprintf(cmd_topic, "%s/switch/%s/config/cmd", mqtt->hass_topic, mqtt->clientid);
+	sprintf(energy_state_topic, "%s/energy", mqtt->pub_topic);
 	for (uint8_t i = 0; i < PLUG_NUM; i++)
 	{
 		sprintf(plug_cmd_topic_list[i], "%s/plug_%d/cmd", mqtt->pub_topic, i);
@@ -297,22 +349,91 @@ void user_mqtt_publish(char *data)
 
 void mqtt_report_config(void)
 {
-	for (uint8_t i = 0; i < PLUG_NUM; i++)
+	char topic[MQTT_TOPIC_MAX_LEN + 1];
+	uint8_t i;
+
+	/* 6 路插座开关的自动发现 + 立即发布当前状态（retained，使开关上线即可用） */
+	for (i = 0; i < PLUG_NUM; i++)
 	{
-		sprintf(mqtt_content_buff, hass_plug_config, user_mqtt_config.clientid, i, user_mqtt_config.clientid, i, user_mqtt_config.pub_topic, i);
+		sprintf(mqtt_content_buff, hass_plug_config,
+				i + 1,
+				user_mqtt_config.clientid, i,
+				user_mqtt_config.pub_topic, i,
+				user_mqtt_config.clientid, user_mqtt_config.clientid);
 		topic_message_publish_retained(plug_config_topic_list[i], mqtt_content_buff, strlen(mqtt_content_buff), 0);
-		// user_mqtt_topic_publish(plug_config_topic_list[i], mqtt_topic_buff);
+		mqtt_report_plug_status(i); /* 发布 retained 状态，HA 立刻可见 on/off */
+		msleep(30);
 	}
+
+	/* BL0937 计量传感器的自动发现（仅功率与总电量；电压/电流为 CF1 关时的合成值，已屏蔽） */
+	for (i = 0; i < HASS_SENSOR_NUM; i++)
+	{
+		sprintf(topic, "%s/sensor/%s/%s/config",
+				user_mqtt_config.hass_topic, user_mqtt_config.clientid, hass_sensors[i].key);
+
+		sprintf(mqtt_content_buff, hass_sensor_config,
+				user_mqtt_config.clientid, hass_sensors[i].cn,
+				user_mqtt_config.clientid, hass_sensors[i].key,
+				energy_state_topic, hass_sensors[i].key,
+				hass_sensors[i].unit, hass_sensors[i].dclass, hass_sensors[i].sclass,
+				user_mqtt_config.clientid, user_mqtt_config.clientid);
+
+		topic_message_publish_retained(topic, mqtt_content_buff, strlen(mqtt_content_buff), 0);
+		msleep(50);
+	}
+
+	/* 主动撤销不再支持的电压/电流传感器发现（旧固件可能留下 retained 配置，不清会一直在 HA 里） */
+	sprintf(topic, "%s/sensor/%s/voltage/config", user_mqtt_config.hass_topic, user_mqtt_config.clientid);
+	topic_message_publish_retained(topic, "{}", 2, 0);
+	sprintf(topic, "%s/sensor/%s/current/config", user_mqtt_config.hass_topic, user_mqtt_config.clientid);
+	topic_message_publish_retained(topic, "{}", 2, 0);
 }
 
 void mqtt_clear_config(void)
 {
-	for (uint8_t i = 0; i < PLUG_NUM; i++)
+	char topic[MQTT_TOPIC_MAX_LEN + 1];
+	uint8_t i;
+
+	for (i = 0; i < PLUG_NUM; i++)
 	{
 		sprintf(mqtt_content_buff, "{}");
 		topic_message_publish_retained(plug_config_topic_list[i], mqtt_content_buff, strlen(mqtt_content_buff), 0);
 		// user_mqtt_topic_publish(plug_config_topic_list[i], mqtt_topic_buff);
 	}
+
+	/* 一并清掉计量传感器的自动发现 */
+	for (i = 0; i < HASS_SENSOR_NUM; i++)
+	{
+		sprintf(topic, "%s/sensor/%s/%s/config",
+				user_mqtt_config.hass_topic, user_mqtt_config.clientid, hass_sensors[i].key);
+		topic_message_publish_retained(topic, "{}", 2, 0);
+		msleep(50);
+	}
+
+	/* 清掉已屏蔽的电压/电流传感器发现（旧固件残留） */
+	sprintf(topic, "%s/sensor/%s/voltage/config", user_mqtt_config.hass_topic, user_mqtt_config.clientid);
+	topic_message_publish_retained(topic, "{}", 2, 0);
+	sprintf(topic, "%s/sensor/%s/current/config", user_mqtt_config.hass_topic, user_mqtt_config.clientid);
+	topic_message_publish_retained(topic, "{}", 2, 0);
+}
+
+/* 上报一次计量数据（仅功率与电量；电压/电流为 CF1 关时的合成值，已屏蔽） */
+void mqtt_report_energy(void)
+{
+	char p[12];
+	char e[16], et[16], ey[16];
+
+	bl0937_fmt_float(p, bl0937.power, 1);
+	bl0937_fmt_float(e, bl0937_energy_kwh(), 3);
+	bl0937_fmt_float(et, bl0937_today_kwh(), 3);
+	bl0937_fmt_float(ey, bl0937_yesterday_kwh(), 3);
+
+	sprintf(mqtt_content_buff,
+			"{\"power\":%s,\"energy\":%s,"
+			"\"today\":%s,\"yesterday\":%s,\"valid\":%d}",
+			p, e, et, ey, bl0937.valid ? 1 : 0);
+
+	user_mqtt_topic_publish(energy_state_topic, mqtt_content_buff);
 }
 
 void mqtt_report_status(void)
@@ -326,16 +447,13 @@ void mqtt_report_status(void)
 
 void mqtt_report_plug_status(uint8_t i)
 {
-	if (i < PLUG_NUM)
+	/* retained：开关状态断电后仍能保持，HA 一上线即可见真实 on/off */
+	if (i < PLUG_NUM && mqtt_is_connected)
 	{
 		if (plug_status.plug[i] > 0)
-		{
-			user_mqtt_topic_publish(plug_status_topic_list[i], "ON");
-		}
+			topic_message_publish_retained(plug_status_topic_list[i], "ON", 2, 0);
 		else
-		{
-			user_mqtt_topic_publish(plug_status_topic_list[i], "OFF");
-		}
+			topic_message_publish_retained(plug_status_topic_list[i], "OFF", 3, 0);
 	}
 }
 

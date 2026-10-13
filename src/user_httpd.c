@@ -13,6 +13,7 @@
 #include "user_function.h"
 #include "user_mqtt.h"
 #include "user_rtc.h"
+#include "user_web.h"
 
 #define HFEASY_VERSION_MAJOR 0
 #define HFEASY_VERSION_MINOR 4
@@ -28,15 +29,13 @@ enum
 	HFTIMER_ID_LED,
 };
 
-#define HTTPD_MAX_PAGES 10
-
-static const char *http_header = "HTTP/1.1 200 OK\r\n"
-								 "Server: HTTPD\r\n"
-								 "Connection: close\r\n\r\n";
+// 页面表容量。原有 8 个接口 + 后台管理页面的 8 个分片，留出余量
+#define HTTPD_MAX_PAGES 32
 
 struct httpd_page
 {
 	const char *url;
+	const char *ctype; // 响应 Content-Type，NULL 时用 text/plain
 	void (*callback)(char *url, char *rsp);
 } httpd_pages[HTTPD_MAX_PAGES] = {
 	{.url = NULL},
@@ -155,7 +154,7 @@ int USER_FUNC httpd_arg_find(char *url, char *slot0, char *slot1, char *slot2, c
 	return 0;
 }
 
-int USER_FUNC httpd_add_page(const char *url, void (*callback)(char *url, char *rsp))
+int USER_FUNC httpd_add_page_ex(const char *url, const char *ctype, void (*callback)(char *url, char *rsp))
 {
 	int i;
 
@@ -168,9 +167,15 @@ int USER_FUNC httpd_add_page(const char *url, void (*callback)(char *url, char *
 		return -1;
 
 	httpd_pages[i].url = url;
+	httpd_pages[i].ctype = ctype;
 	httpd_pages[i].callback = callback;
 
 	return 0;
+}
+
+int USER_FUNC httpd_add_page(const char *url, void (*callback)(char *url, char *rsp))
+{
+	return httpd_add_page_ex(url, NULL, callback);
 }
 
 static int USER_FUNC httpd_callback(char *url, char *rsp)
@@ -189,8 +194,12 @@ static int USER_FUNC httpd_callback(char *url, char *rsp)
 	{
 		if (strcmp(p->url, buf) == 0)
 		{
-			strcpy(r, http_header);
-			r += strlen(http_header);
+			/* 响应头在这里现拼，才能按页面给出正确的 Content-Type。
+			 * 刻意压到最短，把缓冲留给页面内容（见 user_web.c 顶部说明）。 */
+			r += sprintf(r, "HTTP/1.1 200 OK\r\n"
+							"Connection: close\r\n"
+							"Content-Type: %s\r\n\r\n",
+						 p->ctype ? p->ctype : "text/plain; charset=utf-8");
 			p->callback(url, r);
 			return 0;
 		}
@@ -299,8 +308,8 @@ void config_cbk(char *url, char *rsp)
 	char *param = strstr(url, "?json=");
 	if (param != NULL)
 	{
-		strrpc(param, "\%22", "\"");
-		strrpc(param, "\%20", " ");
+		/* 做一次完整的 percent-decode，前端可以直接用 encodeURIComponent */
+		convert_ascii(param + 6);
 		user_function_cmd_received(param + 6, strlen(param + 6), rsp);
 	}
 	else
@@ -316,12 +325,15 @@ void USER_FUNC httpd_init(void)
 	if (hfhttpd_url_callback_register(httpd_callback, 0) != HF_SUCCESS)
 		u_printf("error registering url callback\r\n");
 
-	httpd_add_page("/status", status_cbk);
-	httpd_add_page("/task", status_cbk_all);
+	httpd_add_page_ex("/status", "application/json; charset=utf-8", status_cbk);
+	httpd_add_page_ex("/task", "application/json; charset=utf-8", status_cbk_all);
 	httpd_add_page("/config", config_cbk);
 	httpd_add_page("/report_hass", report_hass_cbk);
 	httpd_add_page("/clear_hass", clear_hass_cbk);
 	httpd_add_page("/restart", restart_cbk);
 	httpd_add_page("/soft_restart", soft_restart_cbk);
 	httpd_add_page("/start_ap", start_ap_cbk);
+
+	/* 后台管理页面（http://<设备IP>/admin） */
+	user_web_init();
 }

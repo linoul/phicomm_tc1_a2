@@ -2,7 +2,7 @@
 include Makefile.mk
 
 BUILD_PATH = $(shell pwd)
-SDK_PATH = $(BUILD_PATH)/sdk/4.13
+SDK_PATH = $(BUILD_PATH)/sdk/4.14
 LINKERSCRIPT = $(SDK_PATH)/libs/LPBX3.ld
 
 PROJECT_NAME=lpt230
@@ -24,8 +24,14 @@ OBJDUMP  = $(CROSS)objdump
 
 DBGFLAGS   = 	-g
 OPTFLAGS   = 	-Os -fomit-frame-pointer
-INCLUDE    =  -I$(SDK_PATH)/include/ -I$(SDK_PATH)/include/hsf/ -I$(SDK_PATH)/include/hal/api -I$(SDK_PATH)/include/hal/api
+INCLUDE    =  -I$(SDK_PATH)/include/ -I$(SDK_PATH)/include/hsf/ -I$(SDK_PATH)/include/hal/api
 INCLUDE    += -I$(SDK_PATH)/include/hal/targets/cmsis -I$(SDK_PATH)/include/rtos/rtx/TARGET_CORTEX_M -I$(SDK_PATH)/include/lwip-wifi/arch -I$(SDK_PATH)/include/lwip-sys
+# 以下路径原本只在 Keil 工程 projects/LPT230_gcc.uvprojx 的 IncludePath 里，
+# GCC Makefile 缺了它们 -> user_mqtt.c 找不到 MQTTClient.h，构建必然失败。补齐。
+INCLUDE    += -I$(SDK_PATH)/include/hal/targets/cmsis/TARGET_RDA/TARGET_UNO_91H
+INCLUDE    += -I$(SDK_PATH)/include/mdns
+INCLUDE    += -I$(BUILD_PATH)/thirdpartylib/Cyassl
+INCLUDE    += -I$(BUILD_PATH)/thirdpartylib/MQTT/MQTTClient-C -I$(BUILD_PATH)/thirdpartylib/MQTT/MQTTPacket
 
 TOOLS_CFLAGS = -I$(SDK_PATH)/include
 
@@ -36,6 +42,9 @@ ARCH_FLAGS = -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=softfp
 CFLAGS    +=  $(CPPFLAGS) $(ARCH_FLAGS)  -Werror=implicit-function-declaration -Werror=maybe-uninitialized
 CFLAGS +=  -Wvla -c -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -fmessage-length=0 -fno-exceptions -fno-builtin -ffunction-sections 
 CFLAGS += -fdata-sections  -funsigned-char -MMD -fno-delete-null-pointer-checks -Os
+# user_config.h 里是「暂定定义」形式的全局变量（char strMac[13]; 这种），
+# GCC 10 之后默认 -fno-common 会报 multiple definition，显式开回 -fcommon
+CFLAGS += -fcommon
 CFLAGS += -D__LPT230__ -DHF_OTA_SUPPORT -DTOOLCHAIN_GCC_ARM -DLWIP_TIMEVAL_PRIVATE=0 -include $(SDK_PATH)/include/mbed_config.h
 
 

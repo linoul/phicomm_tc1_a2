@@ -1,5 +1,16 @@
-phicomm_tc1_a2
+作为https://github.com/zhangyantsing/phicomm_tc1_a2的分支
 =================
+
+## 本分支新增（相对上游）
+
+在原作者固件基础上加了两块东西，原有功能与接口全部保持兼容：
+
+* **Web 后台管理页面** `http://<设备IP>/admin`
+  仿 [qlwz/esp_dc1](https://github.com/qlwz/esp_dc1) 的页签式界面：设备状态、6 路开关控制、
+  计量标定、MQTT 设置、固件信息。
+* **BL0937 电能计量**：功率 / 用电量统计（实测），电压取电网常数、电流按 `P/V` 反算，
+  并接入 MQTT 自动发现。
+
 
 ## 项目介绍  
 斐讯插排 TC1 A2 版本固件。  
@@ -11,11 +22,18 @@ phicomm_tc1_a2
 * 在线升级固件
 * 可通过 mqtt 消息修改配置、控制开关
 * 可通过 http 接口修改配置、控制开关
+* **Web 后台管理页面（本分支新增）**
+* **自定义按键功能/童锁（本分支新增）**
+* **BL0937 功率/电量统计（本分支新增，用原厂板载 BL0937）**
 
 ### 参考项目：  
 * https://github.com/IoTDevice/phicomm_tc1_a2
 * https://github.com/linlyv/TC1_A2
 * https://github.com/a2633063/zTC1
+* https://github.com/qlwz/esp_dc1 （Web 后台界面参考）
+* https://github.com/FUjr/tc1_a1_firmware（ 自定义按键逻辑参考）
+
+
 
 ## 使用方法(引用自https://github.com/linlyv/TC1_A2)
 
@@ -57,10 +75,15 @@ phicomm_tc1_a2
 * 长按按键 8 秒以上，直到按键灯亮1秒后熄灭，松开按键，此时再按是没反应的，说明已经进入SmartLink配网模式
 * 移步至 release ，下载 Smartlink 压缩包，根据自己的手机型号安装安卓或者 ISO 版本，配网（压缩包中有使用方法）
 * app 提示配网成功后，插排会自动重启，如联网失败，长按按键尝试重新配网
-
+* 支持AP模式，连接热点后输入10.0.0.1进入，用户名密码都是 admin，设置wifi
 ### 4. 固件配置
 
 * 获取插排分配到的 IP（根据自己的网络环境自行解决），IP 以 192.168.64.172 为例
+*浏览器输入http://<设备IP>/admin进入管理页面
+    <img src="./doc/ui1.png" width="540">
+*在管理页面可以对各种选项（MQTT/按键/定时任务/功率标定）进行调整
+    <img src="./doc/ui2.png" width="540">
+    <img src="./doc/ui3.png" width="540">
 * 访问插排的 http 接口，获取插排状态，用户名密码都是 admin
 * 支持的接口列表：
     * 修改和查询wifi：http://192.168.64.172

@@ -34,6 +34,18 @@
 #include "user_mqtt.h"
 #include "user_function.h"
 #include "user_httpd.h"
+#include "user_bl0937.h"
+
+/*
+ * HomeKit 默认**不启用**：整套密码学 + 协议约 35KB，会吃掉大半应用分区余量
+ * （应用分区 588K，现有固件已 544K，余量约 56KB）。
+ * 要启用就给工程加 -DHK_ENABLE（见 src/Makefile 的 HK_FLAGS）。
+ * 启用后 homekit 目录下的 .o 才会被链接器提取
+ *（它们打在 userapps.a 里，不引用就不会进固件）。
+ */
+#ifdef HK_ENABLE
+#include "homekit/hk_net.h"
+#endif
 
 
 EXTERNC const int hf_gpio_fid_to_pid_map_table[HFM_MAX_FUNC_CODE];
@@ -87,7 +99,9 @@ const int hf_gpio_fid_to_pid_map_table[HFM_MAX_FUNC_CODE]=
     LPx30_GPIO3,
     LPx30_GPIO5,
     LPx30_GPIO25,
-    LPx30_GPIO7,
+    LPx30_GPIO7,        //HFGPIO_F_USER_DEFINE+8   BL0937 CF   插板功能"PW功率"(= 原 POWER 宏)
+    LPx30_GPIO4,        //HFGPIO_F_USER_DEFINE+9   BL0937 CF1  插板功能"电流电压"
+    LPx30_GPIO12,       //HFGPIO_F_USER_DEFINE+10  BL0937 SEL  插板功能"切换电流电压"
 };
 
 
@@ -299,6 +313,7 @@ static void show_reset_reason(void)
 {
     uint32_t reset_reason=0;
     reset_reason = hfsys_get_reset_reason();
+    reset_reason_code = reset_reason;   /* 暴露到 /status，见 user_config.h */
     
 #if 1
     u_printf("reset_reason:%08x\n",reset_reason);
@@ -354,10 +369,35 @@ void app_init(void)
 char rsp[64]={0};
 char *mac[2]={0};
 
+/*--------------------------------------------------------------------------
+ * 开机进度标记（排错用）
+ *
+ * 排插没有屏幕也没有调试口，串口是唯一的观测手段。下面每个 BOOT_MSG 对应
+ * app_main 里一个初始化阶段：串口最后停在哪个编号，问题就出在它和下一个
+ * 编号之间。常见现象对照：
+ *
+ *   一条 [BOOT] 都看不到              -> App 根本没跑起来，先去看串口里
+ *                                        BootLoader 的报错（多半是烧录问题）
+ *   停在 B2 且反复刷 gpio map file error -> 映射表里有引脚被重复占用
+ *   停在 B6 / B7                     -> 读配置或启动 httpd 卡住
+ *   停在 BC                          -> BL0937 初始化卡住
+ *   走到 B10 之后 LED 不灭、继电器不响  -> App 其实正常，查继电器/按键硬件
+ *
+ * 正式版想关掉这些输出，把 BOOT_TRACE 改成 0 即可。
+ *------------------------------------------------------------------------*/
+#define BOOT_TRACE 1
+#if BOOT_TRACE
+#define BOOT_MSG(s) u_printf("[BOOT] " s "\n")
+#else
+#define BOOT_MSG(s) do { } while (0)
+#endif
+
 int USER_FUNC app_main (void)
 {
+    BOOT_MSG("B1 enter");
     hfdbg_set_level(3);
     HF_Debug(DEBUG_LEVEL,"sdk version(%s),the app_main start time is %s %s\n",hfsys_get_sdk_version(),__DATE__,__TIME__);
+    BOOT_MSG("B2 gpio map check...");
     if(hfgpio_fmap_check(g_module_id)!=0)
     {
         while(1)
@@ -366,45 +406,98 @@ int USER_FUNC app_main (void)
             msleep(1000);
         }
     }
+    BOOT_MSG("B2 ok");
 
     hfsys_register_system_event(sys_event_callback);
     show_reset_reason();
+    BOOT_MSG("B3 event registered");
 
     while(hfsmtlk_is_start())
     {
         msleep(500);
     }
+    BOOT_MSG("B4 smartlink idle");
 
 	if(hfnet_start_uart(HFTHREAD_PRIORITIES_LOW,(hfnet_callback_t)uart_recv_callback)!=HF_SUCCESS)
 	{
 		HF_Debug(DEBUG_WARN,"start uart fail!\n");
 	}
+    BOOT_MSG("B5 uart started");
 
     user_config_init();
+    BOOT_MSG("B6 config loaded");
+
+    /*
+     * 救命逻辑（参考 A1 固件）：上电时按住按键 → 无视童锁/一切配置，
+     * 直接进 AP 配网。防止"童锁开着 + WiFi 配置损坏"的组合让设备彻底失联
+     * （那时按键事件全被童锁拦截，只剩这条开机通道）。
+     * 按住要持续 ~300ms 才算，插拔瞬间的毛刺不触发。
+     * system_start_ap_flag 由 rtc 定时器消费：AT+WMODE=AP + 软重启。
+     */
+    if (key_status() == KEY_DOWN)
+    {
+        msleep(200);
+        if (key_status() == KEY_DOWN)
+        {
+            system_start_ap_flag = true;
+            BOOT_MSG("B6a boot key held -> ap mode");
+        }
+    }
         //Web Server
     if(hfnet_start_httpd(HFTHREAD_PRIORITIES_MID)!=HF_SUCCESS)
     {
         HF_Debug(DEBUG_WARN,"start httpd fail\n");
     }
+    BOOT_MSG("B7 httpd service started");
 
 
     hfgpio_fset_out_high(LED);
+    BOOT_MSG("B8 led on");
+
     key_init();
+    BOOT_MSG("B9 key init done");
+
     rtctime_init();
+    BOOT_MSG("BA rtc init done");
     // user_udp_init( );
 
     httpd_init();
-    
+    BOOT_MSG("BB web pages registered");
+
+    /* BL0937 计量：必须在 rtctime_init() 之后（要读系统时间做跨天统计） */
+    bl0937_init();
+    BOOT_MSG("BC bl0937 init done");
+
     hfnet_get_mac_address(strMac);
+    BOOT_MSG("BD mac read");
+
     hfgpio_fset_out_low(LED);
     load_key_status();
+    BOOT_MSG("BE relays restored");
     while(!hfnet_wifi_is_active())
     {
         msleep(50);
     }
+    BOOT_MSG("BF wifi active");
 
-        
+    /*
+     * HomeKit 必须放在 hfnet_wifi_is_active() **之后**：mdns.h 明确要求
+     * mdns_start() 只能在 network stack 起来之后调用。
+     * 失败不致命 —— 排插的 Web 与 MQTT 功能不受影响，所以只告警。
+     */
+#ifdef HK_ENABLE
+    if (hk_net_start("TC1") != 0)
+    {
+        HF_Debug(DEBUG_WARN, "start homekit fail\n");
+    }
+    else
+    {
+        BOOT_MSG("C0 homekit started");
+    }
+#endif
+
     mqtt_para_init();
+    BOOT_MSG("B10 mqtt ready, app_main done");
     // user_mdns_init( );
 
     return 1;
